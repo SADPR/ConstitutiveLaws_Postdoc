@@ -1,3 +1,0 @@
-Total batches: 1
-Batch info (theta, phi, strain):
-Batch 1: theta=0.00, phi=0.00, strain=[0.01, 0.0, 0.0]

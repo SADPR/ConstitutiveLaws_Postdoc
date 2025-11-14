@@ -3,13 +3,12 @@
 
 import numpy as np
 import KratosMultiphysics as KM
-import KratosMultiphysics.analysis_stage as analysis_stage
 import importlib
-from KratosMultiphysics.StructuralMechanicsApplication import python_solvers_wrapper_structural as structural_solvers
-import KratosMultiphysics.StructuralMechanicsApplication as SMApp  # noqa: F401
+from scipy.sparse import coo_matrix
+import time
 
 # ==============================
-# Config / Material
+# Config / Material (global defaults, kept for reference)
 # ==============================
 REL_EPS      = 1e-14
 PLANE_STRAIN = True   # we assume LinearElasticPlaneStrain2DLaw
@@ -20,6 +19,8 @@ NU_MAT       = 0.4
 ALPHA = 1e-3   # ε_xx
 BETA  = 2e-3   # ε_yy
 S     = 1e-3   # ε_xy = S  (engineering γ_xy = 2S)
+
+STRUCTURAL_MATERIALS_FILE = "StructuralMaterials.json"
 
 # ==============================
 # Helpers
@@ -54,30 +55,15 @@ def build_B_from_DNDX(DNDX):
 
 def build_node_global_map(mp):
     """
-    Deterministic map: [ux(node1), uy(node1), ux(node2), uy(node2), ...]
-    Returns: idx_ux[node.Id] -> pos, idx_uy[node.Id] -> pos, n_dof
+    Deterministic map consistent with TensorAdaptor ordering:
+    [ux(node0), uy(node0), ux(node1), uy(node1), ...] following mp.Nodes iteration.
     """
-    ids = sorted(node.Id for node in mp.Nodes)
     idx_ux, idx_uy = {}, {}
-    for k, nid in enumerate(ids):
-        idx_ux[nid] = 2*k
-        idx_uy[nid] = 2*k + 1
-    n_dof = 2*len(ids)
+    for k, node in enumerate(mp.Nodes):  # same order that TensorAdaptors use
+        idx_ux[node.Id] = 2*k
+        idx_uy[node.Id] = 2*k + 1
+    n_dof = 2*mp.NumberOfNodes()
     return idx_ux, idx_uy, n_dof
-
-
-def pack_global_u(mp, idx_ux, idx_uy, step_index=0):
-    """Pack u according to the deterministic node-based map."""
-    n_dof = 2*len(idx_ux)
-    u = np.zeros(n_dof)
-    for node in mp.Nodes:
-        iux = idx_ux[node.Id]
-        iuy = idx_uy[node.Id]
-        ux = node.GetSolutionStepValue(KM.DISPLACEMENT_X, step_index)
-        uy = node.GetSolutionStepValue(KM.DISPLACEMENT_Y, step_index)
-        u[iux] = ux
-        u[iuy] = uy
-    return u
 
 
 def assemble_global_B(mp, idx_ux, idx_uy):
@@ -85,6 +71,11 @@ def assemble_global_B(mp, idx_ux, idx_uy):
     Build global operator B so that eps_all = B @ u,
     where u is packed with the node-based map.
     3 rows per GP, columns per (ux,uy) of each node.
+
+    Returns:
+        B_glob : csr_matrix (3*n_gp_total, 2*n_nodes)
+        gp_meta: list of (elem_id, igauss) in the same order as the GP rows
+                 in B_glob (i.e., every 3 consecutive rows belong to one GP).
     """
     rows, cols, vals = [], [], []
     gp_meta = []
@@ -122,42 +113,10 @@ def assemble_global_B(mp, idx_ux, idx_uy):
 
     n_rows = row_base
     n_cols = 2*len(idx_ux)
-
-    try:
-        from scipy.sparse import coo_matrix
-        B_glob = coo_matrix((vals, (rows, cols)), shape=(n_rows, n_cols)).tocsr()
-    except Exception:
-        B_glob = np.zeros((n_rows, n_cols))
-        for r, c, v in zip(rows, cols, vals):
-            B_glob[r, c] += v
+    
+    B_glob = coo_matrix((vals, (rows, cols)), shape=(n_rows, n_cols)).tocsr()
 
     return B_glob, gp_meta
-
-
-def gather_ip_arrays(mp, variable_vec, voigt_size_expected=3):
-    """
-    Flatten integration-point vectors (XX, YY, XY) over all elements.
-    Returns:
-        flat    : 1D array of size 3 * n_gp_total
-        gp_meta : list of (elem_id, gp_index)
-    """
-    flat = []
-    gp_meta = []
-    process_info = mp.ProcessInfo
-
-    for elem in mp.Elements:
-        vals = elem.CalculateOnIntegrationPoints(variable_vec, process_info)
-        for igauss, v in enumerate(vals):
-            arr = np.array(v, dtype=float)
-            print(elem.Id)
-            print(variable_vec)
-            print(arr)
-            if arr.shape[0] < voigt_size_expected:
-                raise RuntimeError(f"Voigt size < {voigt_size_expected} for elem {elem.Id}")
-            flat.extend(arr[:3])  # XX, YY, XY
-            gp_meta.append((elem.Id, igauss))
-
-    return np.array(flat), gp_meta
 
 
 def build_C_plane_strain(E, nu):
@@ -171,6 +130,37 @@ def build_C_plane_strain(E, nu):
                   [lam,        lam + 2*mu,   0.0],
                   [0.0,        0.0,          mu]])
     return C
+
+
+def build_C_matrices_from_structural_materials(filename=STRUCTURAL_MATERIALS_FILE):
+    """
+    Kratos-style parsing of StructuralMaterials.json using KM.Parameters.
+
+    Returns:
+        C_by_props_id: dict {properties_id (int): C (3x3 np.array)}
+    """
+    with open(filename, "r") as f:
+        mat_params = KM.Parameters(f.read())
+
+    C_by_props_id = {}
+    props_list = mat_params["properties"]
+
+    for i in range(props_list.size()):
+        props_i = props_list[i]
+        pid = props_i["properties_id"].GetInt()
+
+        mat_vars = props_i["Material"]["Variables"]
+        E  = mat_vars["YOUNG_MODULUS"].GetDouble()
+        nu = mat_vars["POISSON_RATIO"].GetDouble()
+
+        C_by_props_id[pid] = build_C_plane_strain(E, nu)
+
+    print("[INFO] Built C matrices from StructuralMaterials.json:")
+    for pid, C in C_by_props_id.items():
+        print(f"  properties_id = {pid}")
+        print(C)
+
+    return C_by_props_id
 
 
 def impose_affine_displacement_and_fix(mp, A, step_index=0):
@@ -232,6 +222,9 @@ if __name__ == "__main__":
     B_glob, gp_meta_B = assemble_global_B(mp, idx_ux, idx_uy)
     n_gp_total = len(gp_meta_B)
 
+    # Load constitutive matrices per material (properties_id) from StructuralMaterials.json
+    C_by_props_id = build_C_matrices_from_structural_materials(STRUCTURAL_MATERIALS_FILE)
+
     # Affine field matrix A from desired engineering strains:
     # eps_eng = [exx, eyy, gxy] = [ALPHA, BETA, 2S]
     # For symmetric gradient: A = [[exx, s],[s, eyy]] with gxy = 2s.
@@ -255,39 +248,78 @@ if __name__ == "__main__":
     # --- Now postprocess: build u, B u, GL, PK2, compare ---
 
     # 1) Pack global u and compute eps_B = B u
-    u = pack_global_u(mp, idx_ux, idx_uy, step_index=0)
+    ta_disp = KM.TensorAdaptors.HistoricalVariableTensorAdaptor(
+        mp.Nodes, KM.DISPLACEMENT, data_shape=[2]
+    )  # only (ux, uy) since this is 2D
+    ta_disp.CollectData()
+
+    # ta_disp.data has shape (n_nodes, 2) ordered by node Id
+    disp_array = ta_disp.data
+
+    # Flatten to [ux1, uy1, ux2, uy2, ...]
+    u = disp_array.reshape(-1)
+
+    # Compute B u
     eps_B = B_glob.dot(u) if hasattr(B_glob, "dot") else (B_glob @ u)
     eps_B_reshaped = eps_B.reshape(-1, 3)
 
-    # 2) Analytical strain target per GP
+    # 2) Analytical strain target per GP (kinematic, same for all materials)
     target_gp = np.array([ALPHA, BETA, 2*S])  # [εxx, εyy, γxy]
     eps_target = np.tile(target_gp, n_gp_total).reshape(-1, 3)
 
     err_eps = np.abs(eps_B_reshaped - eps_target)
     print("[B-TEST] max |B u - analytic ε| = {:.3e}".format(err_eps.max()))
 
-    # 3) Build C and compute stresses from B u
-    C = build_C_plane_strain(E_MAT, NU_MAT)
-    s_from_B = (C @ eps_B_reshaped.T).T          # (n_gp_total, 3)
-    s_target_gp = C @ target_gp                  # (3,)
-    s_target_all = np.tile(s_target_gp, (n_gp_total, 1))
+    # 3) Compute stresses from B u using C_by_props_id (multi-material)
+
+    s_from_B     = np.zeros_like(eps_B_reshaped)  # (n_gp_total, 3)
+    s_target_all = np.zeros_like(eps_B_reshaped)  # (n_gp_total, 3)
+
+    for igp, (elem_id, igauss) in enumerate(gp_meta_B):
+        elem = mp.Elements[elem_id]
+        pid  = elem.Properties.Id  # should correspond to "properties_id" in StructuralMaterials.json
+
+        C = C_by_props_id[pid]
+
+        # sigma_from_B = C * (eps_B at this GP)
+        s_from_B[igp, :] = C @ eps_B_reshaped[igp, :]
+
+        # target stress = C * target_gp (same analytic strain, material-specific C)
+        s_target_all[igp, :] = C @ target_gp
 
     err_s_C = np.abs(s_from_B - s_target_all)
-    print("[C-TEST] target stress (single GP) =")
-    print("  sigma_xx =", s_target_gp[0])
-    print("  sigma_yy =", s_target_gp[1])
-    print("  tau_xy   =", s_target_gp[2])
     print("[C-TEST] max |C(B u) - C(analytic ε)| = {:.3e}".format(err_s_C.max()))
 
-    # 4) Ask Kratos for GL and PK2 at IPs (after "solve nothing")
-    gl_flat,  gp_meta_gl = gather_ip_arrays(mp, KM.GREEN_LAGRANGE_STRAIN_VECTOR, voigt_size_expected=3)
-    pk2_flat, gp_meta_pk = gather_ip_arrays(mp, KM.PK2_STRESS_VECTOR,          voigt_size_expected=3)
+    # 4) Get GREEN_LAGRANGE_STRAIN_VECTOR and PK2_STRESS_VECTOR
+    #    at Gauss points using GaussPointVariableTensorAdaptor (Elements)
 
-    if gp_meta_gl != gp_meta_B:
-        print("[WARN] gp_meta mismatch between B and GL; comparison is in flat order only.")
+    # --- GREEN_LAGRANGE_STRAIN_VECTOR ---
+    gp_gl = KM.TensorAdaptors.GaussPointVariableTensorAdaptor(
+        mp.Elements, KM.GREEN_LAGRANGE_STRAIN_VECTOR, mp.ProcessInfo
+    )
+    gp_gl.Check()
+    gp_gl.CollectData()
 
-    gl_reshaped  = gl_flat.reshape(-1, 3)
-    pk2_reshaped = pk2_flat.reshape(-1, 3)
+    gl_gp_data  = gp_gl.data       # shape: (n_elem, n_gp_elem, voigt_size)
+    gl_gp_shape = gp_gl.DataShape()  # e.g. [n_gp_elem, voigt_size]
+    voigt_size_gl = gl_gp_shape[1]
+
+    # (n_gp_total, 3): keep first three Voigt components (XX, YY, XY)
+    gl_reshaped = gl_gp_data.reshape(-1, voigt_size_gl)[:, :3]
+
+    # --- PK2_STRESS_VECTOR ---
+    gp_pk2 = KM.TensorAdaptors.GaussPointVariableTensorAdaptor(
+        mp.Elements, KM.PK2_STRESS_VECTOR, mp.ProcessInfo
+    )
+    gp_pk2.Check()
+    gp_pk2.CollectData()
+
+    pk2_gp_data  = gp_pk2.data     # shape: (n_elem, n_gp_elem, voigt_size)
+    pk2_gp_shape = gp_pk2.DataShape()
+    voigt_size_pk2 = pk2_gp_shape[1]
+
+    # (n_gp_total, 3): keep first three Voigt components (XX, YY, XY)
+    pk2_reshaped = pk2_gp_data.reshape(-1, voigt_size_pk2)[:, :3]
 
     # 5) Compare GL vs B u and vs analytic strain
     err_GL_vs_B   = np.abs(gl_reshaped - eps_B_reshaped)
@@ -296,7 +328,7 @@ if __name__ == "__main__":
     print("[GL-TEST] max |GL - (B u)|       = {:.3e}".format(err_GL_vs_B.max()))
     print("[GL-TEST] max |GL - analytic ε|  = {:.3e}".format(err_GL_vs_tgt.max()))
 
-    # 6) Compare PK2 vs C(B u)
+    # 6) Compare PK2 vs C(B u) (multi-material)
     err_PK2_vs_B = np.abs(pk2_reshaped - s_from_B)
     rel_PK2_vs_B = rel_err(pk2_reshaped, s_from_B)
 
@@ -305,7 +337,7 @@ if __name__ == "__main__":
 
     # Optional: print first few GPs
     print("\n[CHECK] First 3 GPs:")
-    for i in range(n_gp_total):
+    for i in range(min(3, n_gp_total)):
         exx_B, eyy_B, gxy_B = eps_B_reshaped[i]
         exx_GL, eyy_GL, gxy_GL = gl_reshaped[i]
         sxx_B, syy_B, txy_B = s_from_B[i]
@@ -317,4 +349,4 @@ if __name__ == "__main__":
         print(f"   PK2_K   = [{sxx_K:.6e}, {syy_K:.6e}, {txy_K:.6e}]")
 
     sim.Finalize()
-    print("\n[DONE] Affine u = A X test with B, C, GL, PK2 comparisons.")
+    print("\n[DONE] Affine u = A X test with B, C (multi-material), GL, PK2 comparisons.")

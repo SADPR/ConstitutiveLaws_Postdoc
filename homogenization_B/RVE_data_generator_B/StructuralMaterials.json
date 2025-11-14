@@ -22,8 +22,8 @@
             },
             "Variables"        : {
                 "DENSITY"       : 7850.0,
-                "YOUNG_MODULUS" : 100000000.0,
-                "POISSON_RATIO" : 0.4
+                "YOUNG_MODULUS" : 1000000000.0,
+                "POISSON_RATIO" : 0.29
             },
             "Tables"           : null
         }
