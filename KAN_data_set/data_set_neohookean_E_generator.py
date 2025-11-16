@@ -172,7 +172,7 @@ while theta <= 360.0:
             strain_history[step, :] = E
             stress_history[step, :] = stress
 
-        output_type = "no_plot"
+        output_type = "plot"
         if output_type == "plot":
             #pl.style.use('science')
             name = "neo_hookean_hyperelastic_law/strain_stress_plots/strain_stress_data_case_" + str(case_number) + ".png"
